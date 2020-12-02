@@ -1,5 +1,5 @@
-
 import multiprocessing as mp
+from copy import copy
 
 import numpy as np
 import pandas as pd
@@ -11,52 +11,116 @@ from sklearn.compose import ColumnTransformer
 from sklearn.preprocessing import StandardScaler
 
 from sklearn.model_selection import train_test_split, StratifiedShuffleSplit, StratifiedKFold, GridSearchCV
+from sklearn.model_selection._search import ParameterGrid
 
-from sklearn.linear_model import LinearRegression, LogisticRegression
+from sklearn.linear_model import Ridge, LogisticRegression
 from sklearn.ensemble import GradientBoostingRegressor, GradientBoostingClassifier, RandomForestRegressor, RandomForestClassifier
 
-#import xbart
+from xbcausalforest import XBCF
+# Monkeypatch XBCF class to to datapreprocessing automatically
+class myXBCF(XBCF):
+    def fit(self, x_t, x, y, z, p_cat=0):
+        z= z.astype('int32')
+
+        self.sdy = np.std(y)
+        y = y - np.mean(y)
+        y = y / self.sdy
+
+        super().fit(x_t, x, y, z, p_cat=p_cat)
+
+        return self
+
+
+    def predict(self, *args,**kwargs):
+        tauhats = super().predict(*args,**kwargs)
+        
+        b = self.b.transpose()
+
+        thats = self.sdy * tauhats * (b[1] - b[0])
+        thats_mean = np.mean(thats[:, self.get_params()['burnin']:], axis=1)
+        
+        return thats_mean
 
 import sys
-sys.path.append('/Users/hauptjoh/projects/treatment-learn')
+sys.path.append('/Users/hauptjoh/projects/research/treatment-learn')
 
 from treatlearn.double_robust_transformation import DoubleRobustTransformer
 from treatlearn.indirect import SingleModel, HurdleModel, TwoModelRegressor
+from treatlearn.evaluation import transformed_outcome_loss
 
 def predict_treatment_models(X, y, c, g, tau_conversion, tau_basket, tau_response, split, fold_index):
 
     treatment_model_lib = {}
     conversion_model_lib = {}
-    regression_model_lib = {}
+    #regression_model_lib = {}
     N_JOBS=1
 
 
-    params = {"gbt":
-        {"learning_rate" : 0.05,
+    params = {
+    "gbtr":
+        {"learning_rate" : 0.01,
         "n_estimators" : 100,
-        "max_depth" : 2,
-        "subsample" : 0.7,
-        "n_iter_no_change" : 10,
-        "validation_fraction" : 0.1
+        "max_depth" : 3,
+        "subsample" : 0.95,
+        'min_samples_leaf':0.01,
+    },
+    'gbtr_2ndstage' : {
+        'learning_rate':[0.05, 0.075, 0.1, 0.125, 0.15], 
+        'max_depth':[2,3,4],
+        'n_estimators':[100],
+        'subsample':[0.95],
+        #'max_features':[0.9],
+        'min_samples_leaf':[1, 50, 100],
+        },
+    "gbtc":
+        {"learning_rate" : 0.01,
+        "n_estimators" : 100,
+        "max_depth" : 3,
+        "subsample" : 0.95,
+        'min_samples_leaf':0.01,
     },
         "rf":{
         "n_estimators" : 500,
         "min_samples_leaf" : 50
     },
-         "reg":{
-         "C":1
+    "reg":{
+         "alpha":10
     },
     "logit":{
-        "C":1
-    }}
+        "C":1,
+        'solver':'liblinear',
+        'max_iter':1000
+    },
+    'xbcf':{
+        'num_sweeps':100,
+        'burnin':20,
+        'num_trees_pr':100,
+        'num_trees_trt':50,
+        'num_cutpoints':100,
+        'alpha_pr':0.95,
+        'beta_pr':2,
+        'alpha_trt':0.95,
+        'beta_trt':2,        
+    }
+    }
 
     # Tuning grids when tuning is enabled
-    param_grid = {'gbt' : {
-    'learning_rate':[0.01,0.025,0.05],
-    'max_depth':[2,3,4],
-    'n_estimators':[100,200,400,600,800],
-    'n_iter_no_change':[100],
-    'subsample':[0.8]
+    param_grid = {
+    'gbtr' : {
+        'learning_rate':[0.05, 0.075, 0.1, 0.125, 0.15], 
+        'max_depth':[2,3,4],
+        'n_estimators':[100],
+        'subsample':[0.95],
+        #'max_features':[0.9],
+        'min_samples_leaf':[1, 50, 100],
+        },
+    'gbtc' : {
+        'learning_rate':[0.05, 0.075, 0.1, 0.125, 0.15], 
+        'max_depth':[2,3,4],
+        'n_estimators':[100],
+        'subsample':[0.95],
+        #'max_features':[0.9],
+        'min_samples_leaf':[1, 50, 100],
         },
     'rf' : {
         'n_estimators':[500],
@@ -64,15 +128,18 @@ def predict_treatment_models(X, y, c, g, tau_conversion, tau_basket, tau_respons
         'max_features': [0.05,0.1,0.15],
     },
     "reg":{
-         "C":[0.1,0.5,1,2,4,6,8,10]
+         "alpha":[10, 2, 1, 0.5, 0.25, 0.166, 0.125, 0.1]
     },
     "logit":{
-        "C":[0.1,0.5,1,2,4,6,8,10]
+        "C":[0.1,0.5,1,2,4,6,8,10],
+        'solver':['liblinear'],
+        'max_iter':[1000]
     }}
 
 
     # Find columns that are not binary with max=1
     num_columns = np.where(X.columns[(X.max(axis=0) != 1)])[0].tolist()
+    n_cat = (X.max(axis=0) == 1).sum()
 
     # Split the train and validation data
     X_val, y_val, c_val, g_val, tau_conversion_val, tau_basket_val, tau_response_val = [obj.to_numpy().astype(float)[split[1]] for obj in [X, y, c, g, tau_conversion, tau_basket, tau_response]]
@@ -100,40 +167,94 @@ def predict_treatment_models(X, y, c, g, tau_conversion, tau_basket, tau_respons
     Xg_val = np.c_[X_val, g_val]
 
     # Double robust transformation
-    # TODO: Cross fitting to avoid overfitting the nuisance models
+    # TODO: Cross fitting to avoid overfitting the nuisance models during model tuning
+    # Note that the final model evaluaton on X_val is unaffected
     dr = DoubleRobustTransformer()
     y_dr = dr.fit_transform(X, y, g)
     y_dr.mean()
 
-
     #### Parameter Tuning  ####
-    cv = GridSearchCV(GradientBoostingRegressor(), param_grid["gbt"], 'neg_mean_squared_error', n_jobs=N_JOBS, verbose=0, cv=5)
-    cv.fit(X, y)
-    params[model] = cv.best_params_
-        
-    # cv = GridSearchCV(treatment_model_lib[model], param_grid[model], 'neg_mean_squared_error', n_jobs=N_JOBS, verbose=0, cv=5)
-    # cv.fit(X, y_dr)
-    # treatment_model_lib[model].set_params(**cv.best_params_)
+    # Cross-validation folds stratified randomization by (outcome x treatment group)
+    splitter = StratifiedKFold(n_splits=10, shuffle=True, random_state=123)
+    cg_groups = 2*g+c # Groups 0-4 depending on combinations [0,1]x[0,1]
+    folds = list(splitter.split(X, cg_groups))
+    folds_c1 = list(splitter.split(X[c==1,:], g[c==1]))
 
-    cv = GridSearchCV(LinearRegression(), param_grid["reg"], 'neg_mean_squared_error', n_jobs=N_JOBS, verbose=0, cv=5)
+    ## Simple GBT predictors
+    # 
+    cv = GridSearchCV(GradientBoostingRegressor(), param_grid["gbtr"], scoring='neg_mean_squared_error', n_jobs=N_JOBS, verbose=0, cv=folds)
+    cv.fit(X, y)
+    params["gbtr"] = cv.best_params_
+    print(f"gbtr params: {cv.best_params_}")
+
+    cv = GridSearchCV(GradientBoostingClassifier(), param_grid["gbtc"], scoring='neg_brier_score', n_jobs=N_JOBS, verbose=0, cv=folds)
+    cv.fit(X, c)
+    params["gbtc"] = cv.best_params_
+    print(f"gbtc params: {cv.best_params_}")
+
+    cv = GridSearchCV(GradientBoostingRegressor(), param_grid["gbtr"], scoring='neg_mean_squared_error', n_jobs=N_JOBS, verbose=0, cv=folds_c1)
+    cv.fit(X[c==1,:], y[c==1])
+    params["gbtr_2ndstage"] = cv.best_params_
+    print(f"gbtr_2ndstage params: {cv.best_params_}")
+
+    ## Simple linear predictors
+    cv = GridSearchCV(Ridge(), param_grid["reg"], scoring='neg_mean_squared_error', n_jobs=N_JOBS, verbose=0, cv=folds)
     cv.fit(X, y)
     params["reg"] = cv.best_params_
+    print(f"reg params: {cv.best_params_}")
 
-    cv = GridSearchCV(LogisticRegression(), param_grid["logit"], 'neg_mean_squared_error', n_jobs=N_JOBS, verbose=0, cv=5)
+    cv = GridSearchCV(LogisticRegression(solver='liblinear', max_iter=1000), param_grid["logit"], scoring='neg_brier_score', n_jobs=N_JOBS, verbose=0, cv=folds)
     cv.fit(X, c)
     params["logit"] = cv.best_params_
+    print(f"logit params: {cv.best_params_}")
+
+    cv = GridSearchCV(Ridge(), param_grid["reg"], scoring='neg_mean_squared_error', n_jobs=N_JOBS, verbose=0, cv=folds_c1)
+    cv.fit(X, y)
+    params["reg_2ndstage"] = cv.best_params_
+    print(f"reg_2ndstage params: {cv.best_params_}")
+    
+
+    def grid_search_cv(X, y, g, estimator, param_grid, folds, **kwargs):
+        list_param_grid = list(ParameterGrid(param_grid))
+        list_param_loss = []
+        for param in list_param_grid:
+            list_split_loss = []
+            for split in folds:
+                    # Split the train and validation data
+                    _estimator = copy(estimator)
+                    X_val, y_val, g_val = [obj[split[1]] for obj in [X, y, g]]
+                    X_train, y_train, g_train = [obj[split[0]] for obj in [X, y, g]]
+                    _estimator.set_params(**param)
+                    _estimator.fit(X=X_train,y=y_train,g=g_train, **{name:value[split[0]] for name,value in kwargs.items()})
+                    pred = _estimator.predict(X_val)
+                    tol = transformed_outcome_loss(pred, y_val, g_val)
+                    list_split_loss.append(tol)
+            list_param_loss.append(np.mean(list_split_loss))
+        return list_param_grid[list_param_loss.index(min(list_param_loss))]
+
+
+    # Recommended defaults from XBCF paper
+    params['xbcf']['tau_pr'] = 0.1/params['xbcf']['num_trees_pr'] # 0.1 * var(y_norm) = 0.1
+    params['xbcf']['tau_trt'] = 0.1/params['xbcf']['num_trees_trt']
+    params['xbcf']['mtry_pr'] = int(X.shape[1])
+    params['xbcf']['mtry_trt'] = int(X.shape[1])
+    print(f"xbcf params: {params['xbcf']}")
 
     #### Single Model ####
     ## GBT regression
-    single_gbt_regressor = SingleModel(GradientBoostingRegressor(**params["gbt"]))
-    single_gbt_regressor.fit(X, y, treatment_group=g)
+    single_gbt_regressor = SingleModel(GradientBoostingRegressor(**params["gbtr"]))
+    # Tune single model based on Transformed Outcome Loss
+    best_params = grid_search_cv(X, y, g, single_gbt_regressor, param_grid['gbtr'], folds)
+    single_gbt_regressor.set_params(**best_params)
+    print(f"single model GBT params: {best_params}")
 
+    single_gbt_regressor.fit(X, y, g=g)
     treatment_model_lib['single-model_outcome_gbt'] = single_gbt_regressor
 
 
     ## RF regression
     # single_rf_regressor = SingleModel(RandomForestRegressor(**params["rf"]))
-    # single_rf_regressor.fit(X, y, treatment_group=g)
+    # single_rf_regressor.fit(X, y, g=g)
 
     # treatment_model_lib['single_model_rf'] = single_rf_regressor
 
@@ -149,29 +270,28 @@ def predict_treatment_models(X, y, c, g, tau_conversion, tau_basket, tau_respons
 
 
     ## Hurdle Gradient Boosting
-    # Conversion classification
-    conversion_gbt = GradientBoostingClassifier(**params["gbt"])
-    conversion_gbt.fit(Xg, c)
+    single_hurdle_gbt = SingleModel(HurdleModel(conversion_classifier=GradientBoostingClassifier(**params["gbtc"]), 
+                            value_regressor=GradientBoostingRegressor(**params["gbtr_2ndstage"])))
+    #best_params = grid_search_cv(X=X, y=y, g=g, c=c, estimator=single_hurdle_gbt, param_grid=param_grid['gbtr'], folds=folds)
+    #print(f"single model Hurdle GBT params: {best_params}")
+    # -> Tuning while fixing same parameters for both models of the hurdle does not give good results
 
-    # Basket value (given purchase) regression
-    basket_gbt = GradientBoostingRegressor(**params["gbt"])                                  
-    basket_gbt.fit(Xg[c==1], y[c==1])#, sample_weight=1/conversion_gbt.predict_proba(Xg)[c==1,1])
-
-    treatment_model_lib['single-model_hurdle_gbt'] = SingleModel(HurdleModel(conversion_classifier=conversion_gbt, value_regressor=basket_gbt))
+    single_hurdle_gbt.fit(X=X,y=y,c=c,g=g)
+    treatment_model_lib['single-model_hurdle_gbt'] = single_hurdle_gbt
 
 
     #### Two-Model Approach ####
     ## Linear regression
-    two_model_reg0 = LinearRegression()
+    two_model_reg0 = Ridge(**params['reg'])
     two_model_reg0.fit(X[g==0,:], y[g==0])
-    two_model_reg1 = LinearRegression()
+    two_model_reg1 = Ridge(**params['reg'])
     two_model_reg1.fit(X[g==1,:], y[g==1])
     treatment_model_lib["two-model_outcome_linear"] = TwoModelRegressor(control_group_model=two_model_reg0, treatment_group_model=two_model_reg1)
 
     # ## Gradient Boosting Regression
-    two_model_gbt0 = GradientBoostingRegressor(**params["gbt"])
+    two_model_gbt0 = GradientBoostingRegressor(**params["gbtr"])
     two_model_gbt0.fit(X[g==0,:], y[g==0])
-    two_model_gbt1 = GradientBoostingRegressor(**params["gbt"])
+    two_model_gbt1 = GradientBoostingRegressor(**params["gbtr"])
     two_model_gbt1.fit(X[g==1,:], y[g==1])
 
     treatment_model_lib["two-model_outcome_gbt"] = TwoModelRegressor(control_group_model=two_model_gbt0, treatment_group_model=two_model_gbt1)
@@ -187,19 +307,19 @@ def predict_treatment_models(X, y, c, g, tau_conversion, tau_basket, tau_respons
 
     
     ## Hurdle Linear model
-    conversion_logit0 = LogisticRegression(penalty="l2", C=1, solver='liblinear', max_iter=200)
+    conversion_logit0 = LogisticRegression(**params['logit'])
     conversion_logit0.fit(X[g==0,:], c[g==0])
 
-    basket_reg0 = LinearRegression()                                 
-    basket_reg0.fit(X[(c==1) & (g==0),:], y[(c==1) & (g==0)]) # ,sample_weight=1/conversion_logit0.predict_proba(X)[(c==1) & (g==0), 1]
+    basket_reg0 = Ridge(**params['reg_2ndstage'])                                 
+    basket_reg0.fit(X[(c==1) & (g==0),:], y[(c==1) & (g==0)],sample_weight=1/conversion_logit0.predict_proba(X)[(c==1) & (g==0), 1].clip(0.05,0.95)) # 
 
     hurdle_reg0 = HurdleModel(conversion_classifier=conversion_logit0, value_regressor=basket_reg0)
 
-    conversion_logit1 = LogisticRegression(penalty="l2", C=1, solver='liblinear', max_iter=200)
+    conversion_logit1 = LogisticRegression(**params['logit'])
     conversion_logit1.fit(X[g==1,:], c[g==1])
 
-    basket_reg1 = LinearRegression()                                 
-    basket_reg1.fit(X[(c==1) & (g==1),:], y[(c==1) & (g==1)]) # , sample_weight=1/conversion_logit1.predict_proba(X)[(c==1) & (g==1), 1]
+    basket_reg1 = Ridge(**params['reg_2ndstage'])                                 
+    basket_reg1.fit(X[(c==1) & (g==1),:], y[(c==1) & (g==1)], sample_weight=1/conversion_logit1.predict_proba(X)[(c==1) & (g==1), 1].clip(0.05,0.95)) # 
     
     hurdle_reg1 = HurdleModel(conversion_classifier=conversion_logit1, value_regressor=basket_reg1)
 
@@ -227,40 +347,44 @@ def predict_treatment_models(X, y, c, g, tau_conversion, tau_basket, tau_respons
     # treatment_model_lib["two_model_hurdle_rf"] = TwoModelRegressor(control_group_model=hurdle_rf0, treatment_group_model=hurdle_rf1)
 
     ## Hurdle GBT
-    conversion_gbt0 = GradientBoostingClassifier(**params["gbt"])
-    conversion_gbt0.fit(X[g == 0,:], c[g == 0])
+    two_model_hurdle_gbt = TwoModelRegressor(control_group_model=HurdleModel(
+                                                conversion_classifier=GradientBoostingClassifier(**params["gbtc"]),
+                                                value_regressor=GradientBoostingRegressor(**params["gbtr_2ndstage"]) ), 
+                                             treatment_group_model=HurdleModel(
+                                                 conversion_classifier=GradientBoostingClassifier(**params["gbtc"]),
+                                                value_regressor=GradientBoostingRegressor(**params["gbtr_2ndstage"]) 
+                                             ))
 
-    basket_gbt0 = GradientBoostingRegressor(**params["gbt"])                                  
-    basket_gbt0.fit(X[(c == 1) & (g == 0), :], y[(c == 1) & (g == 0)]) #, sample_weight=1/conversion_gbt0.predict_proba(X)[(c==1) & (g==0), 1]
-
-    hurdle_gbt0 = HurdleModel(conversion_classifier=conversion_gbt0, value_regressor=basket_gbt0)
-
-    conversion_gbt1 = GradientBoostingClassifier(**params["gbt"])
-    conversion_gbt1.fit(X[g == 1, :], c[g == 1])
-
-    basket_gbt1 = GradientBoostingRegressor(**params["gbt"])                                
-    basket_gbt1.fit(X[(c==1) & (g==1),:], y[(c==1) & (g==1)]) #, sample_weight=1/conversion_gbt1.predict_proba(X)[(c==1) & (g==1), 1]
-    hurdle_gbt1 = HurdleModel(conversion_classifier=conversion_gbt1, value_regressor=basket_gbt1)
-
-    treatment_model_lib["two-model_hurdle_gbt"] = TwoModelRegressor(control_group_model=hurdle_gbt0, treatment_group_model=hurdle_gbt1)
+    two_model_hurdle_gbt.fit(X=X, y=y, g=g, c=c)
+    treatment_model_lib["two-model_hurdle_gbt"] = two_model_hurdle_gbt
 
 
     #### Double robust ####
 
     # Regression
-    treatment_model_lib["dr_outcome_linear"] = LinearRegression()
+    cv = GridSearchCV(Ridge(), param_grid['reg'], scoring='neg_mean_squared_error', n_jobs=N_JOBS, verbose=0, cv=folds)
+    cv.fit(X, y_dr)
+    print(f"DR Ridge params: {cv.best_params_}")
+    treatment_model_lib["dr_outcome_linear"] = Ridge(**cv.best_params_)
     treatment_model_lib["dr_outcome_linear"].fit(X, y_dr)
 
     # GBT
-    treatment_model_lib["dr_outcome_gbt"] = GradientBoostingRegressor(**params["gbt"])
+    cv = GridSearchCV(GradientBoostingRegressor(), param_grid['gbtr'], scoring='neg_mean_squared_error', n_jobs=N_JOBS, verbose=0, cv=folds)
+    cv.fit(X, y_dr)
+    print(f"DR GBT params: {cv.best_params_}")
+    treatment_model_lib["dr_outcome_gbt"] = GradientBoostingRegressor(**cv.best_params_)
     treatment_model_lib["dr_outcome_gbt"].fit(X, y_dr)
+
+    #### XBCF ####
+    treatment_model_lib["xbcf_outcome_xbcf"] = myXBCF(**params["xbcf"])
+    treatment_model_lib["xbcf_outcome_xbcf"].fit(x_t=X, x=X, y=y, z=g, p_cat=int(n_cat))
 
 
     ##### Conversion Models ####
-    conversion_model_lib["single-model_outcome_linear"] = LogisticRegression(penalty="l2", C=1, solver='liblinear', max_iter=200)
+    conversion_model_lib["single-model_outcome_linear"] = LogisticRegression(**params['logit'])
     conversion_model_lib["single-model_outcome_linear"].fit(X[g == 1, :], c[g == 1])
 
-    conversion_model_lib["single-model_outcome_gbt"] = GradientBoostingClassifier(**params["gbt"])
+    conversion_model_lib["single-model_outcome_gbt"] = GradientBoostingClassifier(**params["gbtc"])
     conversion_model_lib["single-model_outcome_gbt"].fit(X[g == 1, :], c[g == 1])
 
     # conversion_model_lib["rf"] = RandomForestClassifier(**params["rf"])
@@ -364,11 +488,16 @@ def predict_treatment_models(X, y, c, g, tau_conversion, tau_basket, tau_respons
     }
             })
 
+
+
+#### Script
 if __name__ == "__main__":
     
+    DEBUG = False
+
     # Load the data
 
-    X = pd.read_csv("../data/fashionB_clean_linear.csv")
+    X = pd.read_csv("../data/fashionB_clean_nonlinear.csv")
     #X = data.copy()
 
     # PARAMETERS
@@ -377,7 +506,8 @@ if __name__ == "__main__":
     np.random.seed(SEED)
 
     # Downsampling for debugging
-    #X = X.sample(5000)
+    if DEBUG is True:
+        X = X.sample(5000)
 
     c = X.pop('converted')
     g = X.pop('TREATMENT')
@@ -387,9 +517,7 @@ if __name__ == "__main__":
     tau_response = X.pop('TREATMENT_EFFECT_RESPONSE')
 
 
-    # splitter = StratifiedShuffleSplit(n_splits=2, test_size=0.25, random_state=123)
-    # idx_train, idx_test = next(splitter.split(X,g))
-
+    # Cross-validation folds stratified randomization by (outcome x treatment group)
     splitter = StratifiedKFold(n_splits=N_SPLITS, shuffle=True, random_state=SEED)
     cg_groups = 2*g+c # Groups 0-4 depending on combinations [0,1]x[0,1]
     folds = list(splitter.split(X, cg_groups))
@@ -401,22 +529,23 @@ if __name__ == "__main__":
         except Exception as e:
             library_predictions.append(str(e))
     
-    temp = predict_treatment_models(X, y, c, g, tau_conversion, tau_basket, tau_response, folds[0], 1)
-    print(temp)
+    if DEBUG is True:
+        temp = predict_treatment_models(X, y, c, g, tau_conversion, tau_basket, tau_response, folds[0], 1)
+        print(temp)
+    else:
+        pool = mp.Pool(N_SPLITS)
 
-    # pool = mp.Pool(3)
+        for i,fold in enumerate(folds):
+            pool.apply_async(predict_treatment_models, 
+                args=(X, y, c, g, tau_conversion, tau_basket, tau_response, fold, i), 
+                callback = log_result)
+        pool.close()
+        pool.join()
+        print("Cross-Validation complete.")
 
-    # for i,fold in enumerate(folds):
-    #     pool.apply_async(predict_treatment_models, 
-    #         args=(X, y, c, g, tau_conversion, tau_basket, tau_response, fold, i), 
-    #         callback = log_result)
-    # pool.close()
-    # pool.join()
-    # print("Cross-Validation complete.")
-
-    # #with open("../results/treatment_model_predictions.json", "w") as outfile:
-    # #    json.dump(library_predictions, outfile)
-    # np.save( "../results/treatment_model_predictions", library_predictions, allow_pickle=True)
+        #with open("../results/treatment_model_predictions.json", "w") as outfile:
+        #    json.dump(library_predictions, outfile)
+        np.save( "../results/treatment_model_predictions", library_predictions, allow_pickle=True)
 
     print("Done!")
 
