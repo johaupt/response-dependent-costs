@@ -1,5 +1,7 @@
 import multiprocessing as mp
 from copy import copy
+import itertools
+import collections
 
 import numpy as np
 import pandas as pd
@@ -10,14 +12,38 @@ import seaborn as sns
 from sklearn.compose import ColumnTransformer
 from sklearn.preprocessing import StandardScaler
 
-from sklearn.model_selection import train_test_split, StratifiedShuffleSplit, StratifiedKFold, GridSearchCV
-from sklearn.model_selection._search import ParameterGrid
-
 from sklearn.linear_model import Ridge, LogisticRegression
 from sklearn.ensemble import GradientBoostingRegressor, GradientBoostingClassifier, RandomForestRegressor, RandomForestClassifier
 
+from sklearn.model_selection import train_test_split, StratifiedShuffleSplit, StratifiedKFold, GridSearchCV
+from sklearn.model_selection._search import ParameterGrid
+def get_train_validation_test_split(folds, val_set = True):
+    # Get only test indices per fold
+    folds_test = [fold[1] for fold in folds]
+    
+    # Get union of indices
+    indices = np.concatenate(folds_test)
+    if len(indices) != len(np.unique(indices)): raise ValueError("Overlap in test indices")
+    
+    # Get validation indices per fold by taking next test fold
+    if val_set:
+        folds_validation = collections.deque(folds_test)
+        folds_validation.rotate(-1)
+        folds_validation = list(folds_validation)
+    else:
+        folds_validation = [np.array([]) for fold in folds_test]
+    
+    # Get training indices per fold from remaining
+    folds_train = [np.setdiff1d(indices, np.concatenate([test, val])) for test, val in zip(folds_test, folds_validation)]
+    
+    # Put folds together
+    output = [{'train':train, 'val':val, 'test':test} for train,val,test in zip(folds_train, folds_validation, folds_test)]
+    
+    return output
+
+
 from xbcausalforest import XBCF
-# Monkeypatch XBCF class to to datapreprocessing automatically
+# Monkeypatch XBCF class to do data preprocessing and predicton postprocessing automatically
 class myXBCF(XBCF):
     def fit(self, x_t, x, y, z, p_cat=0):
         z= z.astype('int32')
@@ -41,6 +67,8 @@ class myXBCF(XBCF):
         
         return thats_mean
 
+# Load model definitions from general module
+# See https://github.com/johaupt/treatment-learn
 import sys
 sys.path.append('/Users/hauptjoh/projects/research/treatment-learn')
 
@@ -55,7 +83,7 @@ def predict_treatment_models(X, y, c, g, tau_conversion, tau_basket, tau_respons
     #regression_model_lib = {}
     N_JOBS=1
 
-
+    # Fixed parameters in case no tuning later
     params = {
     "gbtr":
         {"learning_rate" : 0.01,
@@ -104,7 +132,7 @@ def predict_treatment_models(X, y, c, g, tau_conversion, tau_basket, tau_respons
     }
     }
 
-    # Tuning grids when tuning is enabled
+    # Tuning grids when tuning is enabled (default)
     param_grid = {
     'gbtr' : {
         'learning_rate':[0.05, 0.075, 0.1, 0.125, 0.15], 
@@ -137,13 +165,14 @@ def predict_treatment_models(X, y, c, g, tau_conversion, tau_basket, tau_respons
     }}
 
 
-    # Find columns that are not binary with max=1
+    # Find columns that are not binary with max!=1
     num_columns = np.where(X.columns[(X.max(axis=0) != 1)])[0].tolist()
     n_cat = (X.max(axis=0) == 1).sum()
 
     # Split the train and validation data
-    X_val, y_val, c_val, g_val, tau_conversion_val, tau_basket_val, tau_response_val = [obj.to_numpy().astype(float)[split[1]] for obj in [X, y, c, g, tau_conversion, tau_basket, tau_response]]
-    X, y, c, g, tau_conversion, tau_basket, tau_response = [obj.to_numpy().astype(float)[split[0]] for obj in [X, y, c, g, tau_conversion, tau_basket, tau_response]]
+    X_test, y_test, c_test, g_test, tau_conversion_test, tau_basket_test, tau_response_test = [obj.to_numpy().astype(float)[split['test']] for obj in [X, y, c, g, tau_conversion, tau_basket, tau_response]]
+    X_val, y_val, c_val, g_val, tau_conversion_val, tau_basket_val, tau_response_val = [obj.to_numpy().astype(float)[split['val']] for obj in [X, y, c, g, tau_conversion, tau_basket, tau_response]]
+    X, y, c, g, tau_conversion, tau_basket, tau_response = [obj.to_numpy().astype(float)[split['train']] for obj in [X, y, c, g, tau_conversion, tau_basket, tau_response]]
 
 
     # Normalize the data
@@ -160,15 +189,17 @@ def predict_treatment_models(X, y, c, g, tau_conversion, tau_basket, tau_respons
         remainder="passthrough")
 
     X = ct.fit_transform(X)
+    X_test = ct.transform(X_test)
     X_val = ct.transform(X_val)
 
     # Treatment indicator as variable
     Xg = np.c_[X, g]
-    Xg_val = np.c_[X_val, g_val]
+    Xg_test = np.c_[X_test, g_test]
+    Xg_test = np.c_[X_val, g_val]
 
     # Double robust transformation
     # TODO: Cross fitting to avoid overfitting the nuisance models during model tuning
-    # Note that the final model evaluaton on X_val is unaffected
+    # Note that the final model evaluaton on X_test is unaffected
     dr = DoubleRobustTransformer()
     y_dr = dr.fit_transform(X, y, g)
     y_dr.mean()
@@ -181,17 +212,19 @@ def predict_treatment_models(X, y, c, g, tau_conversion, tau_basket, tau_respons
     folds_c1 = list(splitter.split(X[c==1,:], g[c==1]))
 
     ## Simple GBT predictors
-    # 
+    # Tune estimator of spending
     cv = GridSearchCV(GradientBoostingRegressor(), param_grid["gbtr"], scoring='neg_mean_squared_error', n_jobs=N_JOBS, verbose=0, cv=folds)
     cv.fit(X, y)
     params["gbtr"] = cv.best_params_
     print(f"gbtr params: {cv.best_params_}")
 
+    # Tune estimator of conversion
     cv = GridSearchCV(GradientBoostingClassifier(), param_grid["gbtc"], scoring='neg_brier_score', n_jobs=N_JOBS, verbose=0, cv=folds)
     cv.fit(X, c)
     params["gbtc"] = cv.best_params_
     print(f"gbtc params: {cv.best_params_}")
 
+    # Tune estimator of spending given conversion
     cv = GridSearchCV(GradientBoostingRegressor(), param_grid["gbtr"], scoring='neg_mean_squared_error', n_jobs=N_JOBS, verbose=0, cv=folds_c1)
     cv.fit(X[c==1,:], y[c==1])
     params["gbtr_2ndstage"] = cv.best_params_
@@ -212,25 +245,6 @@ def predict_treatment_models(X, y, c, g, tau_conversion, tau_basket, tau_respons
     cv.fit(X, y)
     params["reg_2ndstage"] = cv.best_params_
     print(f"reg_2ndstage params: {cv.best_params_}")
-    
-
-    def grid_search_cv(X, y, g, estimator, param_grid, folds, **kwargs):
-        list_param_grid = list(ParameterGrid(param_grid))
-        list_param_loss = []
-        for param in list_param_grid:
-            list_split_loss = []
-            for split in folds:
-                    # Split the train and validation data
-                    _estimator = copy(estimator)
-                    X_val, y_val, g_val = [obj[split[1]] for obj in [X, y, g]]
-                    X_train, y_train, g_train = [obj[split[0]] for obj in [X, y, g]]
-                    _estimator.set_params(**param)
-                    _estimator.fit(X=X_train,y=y_train,g=g_train, **{name:value[split[0]] for name,value in kwargs.items()})
-                    pred = _estimator.predict(X_val)
-                    tol = transformed_outcome_loss(pred, y_val, g_val)
-                    list_split_loss.append(tol)
-            list_param_loss.append(np.mean(list_split_loss))
-        return list_param_grid[list_param_loss.index(min(list_param_loss))]
 
 
     # Recommended defaults from XBCF paper
@@ -239,6 +253,48 @@ def predict_treatment_models(X, y, c, g, tau_conversion, tau_basket, tau_respons
     params['xbcf']['mtry_pr'] = int(X.shape[1])
     params['xbcf']['mtry_trt'] = int(X.shape[1])
     print(f"xbcf params: {params['xbcf']}")
+    
+    # Custom grid search function to optimize CATE models with extra argument treatment indicator g
+    def grid_search_cv(X, y, g, estimator, param_grid, folds, **kwargs):
+        list_param_grid = list(ParameterGrid(param_grid))
+        list_param_loss = []
+        for param in list_param_grid:
+            list_split_loss = []
+            for split in folds:
+                    # Split the train and validation data
+                    _estimator = copy(estimator)
+                    X_test, y_test, g_test = [obj[split[1]] for obj in [X, y, g]]
+                    X_train, y_train, g_train = [obj[split[0]] for obj in [X, y, g]]
+                    _estimator.set_params(**param)
+                    _estimator.fit(X=X_train,y=y_train,g=g_train, **{name:value[split[0]] for name,value in kwargs.items()})
+                    pred = _estimator.predict(X_test)
+                    tol = transformed_outcome_loss(pred, y_test, g_test) # Minimize transformed outcome loss
+                    list_split_loss.append(tol)
+            list_param_loss.append(np.mean(list_split_loss))
+        return list_param_grid[list_param_loss.index(min(list_param_loss))]
+
+    def grid_search_cv_hurdle(X, y, g, estimator, param_grid_conversion, param_grid_regression, folds, **kwargs):
+        list_param_grid = list(itertools.product(list(ParameterGrid(param_grid_conversion)), 
+                                                 list(ParameterGrid(param_grid_regression))))
+        list_param_loss = []
+        for param in list_param_grid:
+            list_split_loss = []
+            for split in folds:
+                    # Split the train and validation data
+                    _estimator = copy(estimator)
+                    X_test, y_test, g_test = [obj[split[1]] for obj in [X, y, g]]
+                    X_train, y_train, g_train = [obj[split[0]] for obj in [X, y, g]]
+                    
+                    for model in [_estimator.treatment_group_model, _estimator.control_group_model]:
+                        model.conversion_classifier.set_params(**param[0])
+                        model.value_regressor.set_params(**param[1])
+                    
+                    _estimator.fit(X=X_train,y=y_train,g=g_train, **{name:value[split[0]] for name,value in kwargs.items()})
+                    pred = _estimator.predict(X_test)
+                    tol = transformed_outcome_loss(pred, y_test, g_test) # Minimize transformed outcome loss
+                    list_split_loss.append(tol)
+            list_param_loss.append(np.mean(list_split_loss))
+        return list_param_grid[list_param_loss.index(min(list_param_loss))]
 
     #### Single Model ####
     ## GBT regression
@@ -252,29 +308,13 @@ def predict_treatment_models(X, y, c, g, tau_conversion, tau_basket, tau_respons
     treatment_model_lib['single-model_outcome_gbt'] = single_gbt_regressor
 
 
-    ## RF regression
-    # single_rf_regressor = SingleModel(RandomForestRegressor(**params["rf"]))
-    # single_rf_regressor.fit(X, y, g=g)
-
-    # treatment_model_lib['single_model_rf'] = single_rf_regressor
-
-
-    ## Hurdle Random Forest
-    # conversion_rf = RandomForestClassifier(**params["rf"])
-    # conversion_rf.fit(Xg, c)
-
-    # basket_rf = RandomForestRegressor(**params["rf"])                                  
-    # basket_rf.fit(Xg[c==1], y[c==1], sample_weight=1/conversion_rf.predict_proba(Xg)[c==1,1])
-
-    # treatment_model_lib['hurdle_rf'] = SingleModel(HurdleModel(conversion_classifier=conversion_rf, value_regressor=basket_rf))
-
-
     ## Hurdle Gradient Boosting
     single_hurdle_gbt = SingleModel(HurdleModel(conversion_classifier=GradientBoostingClassifier(**params["gbtc"]), 
                             value_regressor=GradientBoostingRegressor(**params["gbtr_2ndstage"])))
     #best_params = grid_search_cv(X=X, y=y, g=g, c=c, estimator=single_hurdle_gbt, param_grid=param_grid['gbtr'], folds=folds)
     #print(f"single model Hurdle GBT params: {best_params}")
     # -> Tuning while fixing same parameters for both models of the hurdle does not give good results
+    # -> Using optimal parameter tuned for outcome prediction instead
 
     single_hurdle_gbt.fit(X=X,y=y,c=c,g=g)
     treatment_model_lib['single-model_hurdle_gbt'] = single_hurdle_gbt
@@ -282,69 +322,44 @@ def predict_treatment_models(X, y, c, g, tau_conversion, tau_basket, tau_respons
 
     #### Two-Model Approach ####
     ## Linear regression
-    two_model_reg0 = Ridge(**params['reg'])
-    two_model_reg0.fit(X[g==0,:], y[g==0])
-    two_model_reg1 = Ridge(**params['reg'])
-    two_model_reg1.fit(X[g==1,:], y[g==1])
-    treatment_model_lib["two-model_outcome_linear"] = TwoModelRegressor(control_group_model=two_model_reg0, treatment_group_model=two_model_reg1)
+    two_model_outcome_linear = TwoModelRegressor(control_group_model=Ridge(**params['reg']), 
+                                                treatment_group_model=Ridge(**params['reg']))
+    best_params = grid_search_cv(X, y, g, two_model_outcome_linear, param_grid['reg'], folds)
+    two_model_outcome_linear.set_params(**best_params)
+    print(f"Two-Model outcome Ridge params: {best_params}")
+    
+    treatment_model_lib["two-model_outcome_linear"] = two_model_outcome_linear.fit(X=X,y=y,g=g)
 
     # ## Gradient Boosting Regression
-    two_model_gbt0 = GradientBoostingRegressor(**params["gbtr"])
-    two_model_gbt0.fit(X[g==0,:], y[g==0])
-    two_model_gbt1 = GradientBoostingRegressor(**params["gbtr"])
-    two_model_gbt1.fit(X[g==1,:], y[g==1])
-
-    treatment_model_lib["two-model_outcome_gbt"] = TwoModelRegressor(control_group_model=two_model_gbt0, treatment_group_model=two_model_gbt1)
-
-    # ## Random Forest Regression
-    # two_model_rf0 = RandomForestRegressor(**params["rf"])    
-    # two_model_rf0.fit(X[g==0,:], y[g==0])
-
-    # two_model_rf1 = RandomForestRegressor(**params["rf"])    
-    # two_model_rf1.fit(X[g==1,:], y[g==1])
-
-    # treatment_model_lib["two_model_rf"] = TwoModelRegressor(control_group_model=two_model_rf0, treatment_group_model=two_model_rf1)
-
+    two_model_outcome_gbt = TwoModelRegressor(control_group_model=GradientBoostingRegressor(**params["gbtr"]), 
+                                              treatment_group_model=GradientBoostingRegressor(**params["gbtr"]))
     
+    best_params = grid_search_cv(X, y, g, two_model_outcome_gbt, param_grid['gbtr'], folds)
+    two_model_outcome_gbt.set_params(**best_params)
+    print(f"Two-Model outcome GBT params: {best_params}")
+
+    treatment_model_lib["two-model_outcome_gbt"] = two_model_outcome_gbt.fit(X=X,y=y,g=g)
+    
+
     ## Hurdle Linear model
-    conversion_logit0 = LogisticRegression(**params['logit'])
-    conversion_logit0.fit(X[g==0,:], c[g==0])
+    two_model_hurdle_linear = TwoModelRegressor(control_group_model=HurdleModel(
+                                                    conversion_classifier=LogisticRegression(**params['logit']),
+                                                    value_regressor=Ridge(**params['reg']) ), 
+                                            treatment_group_model=HurdleModel(
+                                                    conversion_classifier=LogisticRegression(**params['logit']),
+                                                    value_regressor=Ridge(**params['reg']) ) 
+                                            )
 
-    basket_reg0 = Ridge(**params['reg_2ndstage'])                                 
-    basket_reg0.fit(X[(c==1) & (g==0),:], y[(c==1) & (g==0)],sample_weight=1/conversion_logit0.predict_proba(X)[(c==1) & (g==0), 1].clip(0.05,0.95)) # 
+    best_params = grid_search_cv_hurdle(X=X, y=y, g=g, c=c, estimator=two_model_hurdle_linear, 
+                                    param_grid_conversion=param_grid['logit'],
+                                    param_grid_regression=param_grid['reg'], 
+                                    folds=folds) 
+    for model in [two_model_hurdle_linear.treatment_group_model, two_model_hurdle_linear.control_group_model]:
+        model.conversion_classifier.set_params(**best_params[0])
+        model.value_regressor.set_params(**best_params[1])
+    print(f"Two-Model hurdle linear params: {best_params}")
 
-    hurdle_reg0 = HurdleModel(conversion_classifier=conversion_logit0, value_regressor=basket_reg0)
-
-    conversion_logit1 = LogisticRegression(**params['logit'])
-    conversion_logit1.fit(X[g==1,:], c[g==1])
-
-    basket_reg1 = Ridge(**params['reg_2ndstage'])                                 
-    basket_reg1.fit(X[(c==1) & (g==1),:], y[(c==1) & (g==1)], sample_weight=1/conversion_logit1.predict_proba(X)[(c==1) & (g==1), 1].clip(0.05,0.95)) # 
-    
-    hurdle_reg1 = HurdleModel(conversion_classifier=conversion_logit1, value_regressor=basket_reg1)
-
-    treatment_model_lib["two-model_hurdle_linear"] = TwoModelRegressor(control_group_model=hurdle_reg0, treatment_group_model=hurdle_reg1)
-
-
-    ## Hurdle Random Forest
-    # conversion_rf0 = RandomForestClassifier(**params["rf"])
-    # conversion_rf0.fit(X[g==0,:], c[g==0])
-
-    # basket_rf0 = RandomForestRegressor(**params["rf"])                                  
-    # basket_rf0.fit(X[(c==1) & (g==0),:], y[(c==1) & (g==0)], 
-    #             sample_weight=1/conversion_rf0.predict_proba(X)[(c==1) & (g==0), 1])
-
-    # hurdle_rf0 = HurdleModel(conversion_classifier=conversion_rf0, value_regressor=basket_rf0)
-
-    # conversion_rf1 = RandomForestClassifier(**params["rf"])
-    # conversion_rf1.fit(X[g==1,:], c[g==1])
-
-    # basket_rf1 = RandomForestRegressor(**params["rf"])                                  
-    # basket_rf1.fit(X[(c==1) & (g==1),:], y[(c==1) & (g==1)], 
-    #             sample_weight=1/conversion_rf1.predict_proba(X)[(c==1) & (g==1), 1])
-    # hurdle_rf1 = HurdleModel(conversion_classifier=conversion_rf1, value_regressor=basket_rf1)
-
-    # treatment_model_lib["two_model_hurdle_rf"] = TwoModelRegressor(control_group_model=hurdle_rf0, treatment_group_model=hurdle_rf1)
+    treatment_model_lib["two-model_hurdle_linear"] = two_model_hurdle_linear.fit(X=X, y=y, g=g, c=c)
 
     ## Hurdle GBT
     two_model_hurdle_gbt = TwoModelRegressor(control_group_model=HurdleModel(
@@ -354,9 +369,25 @@ def predict_treatment_models(X, y, c, g, tau_conversion, tau_basket, tau_respons
                                                  conversion_classifier=GradientBoostingClassifier(**params["gbtc"]),
                                                 value_regressor=GradientBoostingRegressor(**params["gbtr_2ndstage"]) 
                                              ))
+    
+    param_grid_two_model_hurdle = {
+        'learning_rate':[0.05, 0.1, 0.15], 
+        'max_depth':[2,3,4],
+        'n_estimators':[100],
+        'subsample':[0.95],
+        #'max_features':[0.9],
+        'min_samples_leaf':[50],
+        }
+    best_params = grid_search_cv_hurdle(X=X, y=y, g=g, c=c, estimator=two_model_hurdle_gbt, 
+                                    param_grid_conversion=param_grid_two_model_hurdle,
+                                    param_grid_regression=param_grid_two_model_hurdle, 
+                                    folds=folds) 
+    for model in [two_model_hurdle_gbt.treatment_group_model, two_model_hurdle_gbt.control_group_model]:
+        model.conversion_classifier.set_params(**best_params[0])
+        model.value_regressor.set_params(**best_params[1])
+    print(f"Two-Model hurdle GBT params: {best_params}")
 
-    two_model_hurdle_gbt.fit(X=X, y=y, g=g, c=c)
-    treatment_model_lib["two-model_hurdle_gbt"] = two_model_hurdle_gbt
+    treatment_model_lib["two-model_hurdle_gbt"] = two_model_hurdle_gbt.fit(X=X, y=y, g=g, c=c)
 
 
     #### Double robust ####
@@ -387,10 +418,6 @@ def predict_treatment_models(X, y, c, g, tau_conversion, tau_basket, tau_respons
     conversion_model_lib["single-model_outcome_gbt"] = GradientBoostingClassifier(**params["gbtc"])
     conversion_model_lib["single-model_outcome_gbt"].fit(X[g == 1, :], c[g == 1])
 
-    # conversion_model_lib["rf"] = RandomForestClassifier(**params["rf"])
-    # conversion_model_lib["rf"].fit(X[g==1,:], c[g==1])
-
-
     # ### Evaluation
     # ##### Conversion treatment effect
 
@@ -398,23 +425,20 @@ def predict_treatment_models(X, y, c, g, tau_conversion, tau_basket, tau_respons
     treatment_conversion_test  = {}
 
     treatment_conversion_train["single-model_hurdle_gbt"] = treatment_model_lib['single-model_hurdle_gbt'].model.conversion_classifier.predict_proba( np.c_[X,     np.ones((X.shape[0],1))] )[:,1]     - treatment_model_lib['single-model_hurdle_gbt'].model.conversion_classifier.predict_proba(np.c_[X, np.zeros((X.shape[0],1))])[:,1]
-    treatment_conversion_test["single-model_hurdle_gbt"]  = treatment_model_lib['single-model_hurdle_gbt'].model.conversion_classifier.predict_proba( np.c_[X_val, np.ones((X_val.shape[0],1))] )[:,1] - treatment_model_lib['single-model_hurdle_gbt'].model.conversion_classifier.predict_proba(np.c_[X_val, np.zeros((X_val.shape[0],1))])[:,1]
+    treatment_conversion_test["single-model_hurdle_gbt"]  = treatment_model_lib['single-model_hurdle_gbt'].model.conversion_classifier.predict_proba( np.c_[X_test, np.ones((X_test.shape[0],1))] )[:,1] - treatment_model_lib['single-model_hurdle_gbt'].model.conversion_classifier.predict_proba(np.c_[X_test, np.zeros((X_test.shape[0],1))])[:,1]
 
     treatment_conversion_train["two-model_hurdle_linear"] = treatment_model_lib['two-model_hurdle_linear'].treatment_group_model.predict_hurdle(X) - treatment_model_lib['two-model_hurdle_linear'].control_group_model.predict_hurdle(X)
-    treatment_conversion_test["two-model_hurdle_linear"] = treatment_model_lib['two-model_hurdle_linear'].treatment_group_model.predict_hurdle(X_val) - treatment_model_lib['two-model_hurdle_linear'].control_group_model.predict_hurdle(X_val)
+    treatment_conversion_test["two-model_hurdle_linear"] = treatment_model_lib['two-model_hurdle_linear'].treatment_group_model.predict_hurdle(X_test) - treatment_model_lib['two-model_hurdle_linear'].control_group_model.predict_hurdle(X_test)
 
     treatment_conversion_train["two-model_hurdle_gbt"] = treatment_model_lib['two-model_hurdle_gbt'].treatment_group_model.predict_hurdle(X) - treatment_model_lib['two-model_hurdle_gbt'].control_group_model.predict_hurdle(X)
-    treatment_conversion_test["two-model_hurdle_gbt"] = treatment_model_lib['two-model_hurdle_gbt'].treatment_group_model.predict_hurdle(X_val) - treatment_model_lib['two-model_hurdle_gbt'].control_group_model.predict_hurdle(X_val)
+    treatment_conversion_test["two-model_hurdle_gbt"] = treatment_model_lib['two-model_hurdle_gbt'].treatment_group_model.predict_hurdle(X_test) - treatment_model_lib['two-model_hurdle_gbt'].control_group_model.predict_hurdle(X_test)
     
-    # treatment_conversion_train["hurdle_rf"] = treatment_model_lib['hurdle_rf'].model.conversion_classifier.predict_proba( np.c_[X,     np.ones((X.shape[0],1))] )[:,1]     - treatment_model_lib['hurdle_rf'].model.conversion_classifier.predict_proba(np.c_[X, np.zeros((X.shape[0],1))])[:,1]
-    # treatment_conversion_test["hurdle_rf"]  = treatment_model_lib['hurdle_rf'].model.conversion_classifier.predict_proba( np.c_[X_val, np.ones((X_val.shape[0],1))] )[:,1] - treatment_model_lib['hurdle_rf'].model.conversion_classifier.predict_proba(np.c_[X_val, np.zeros((X_val.shape[0],1))])[:,1]
-
     treatment_conversion_train["ATE__"] = (c[g==1].mean())-(c[g==0].mean()) * np.ones([X.shape[0]])
-    treatment_conversion_test["ATE__"] =   (c[g==1].mean())-(c[g==0].mean()) * np.ones([X_val.shape[0]])
+    treatment_conversion_test["ATE__"] =   (c[g==1].mean())-(c[g==0].mean()) * np.ones([X_test.shape[0]])
 
     # Baselines
     treatment_conversion_train["oracle__"] = tau_conversion
-    treatment_conversion_test["oracle__"] =  tau_conversion_val
+    treatment_conversion_test["oracle__"] =  tau_conversion_test
 
 
     # ##### Basket value treatment effect
@@ -423,69 +447,70 @@ def predict_treatment_models(X, y, c, g, tau_conversion, tau_basket, tau_respons
     treatment_basketvalue_test  = {}
 
     treatment_basketvalue_train["single-model_hurdle_gbt"] = treatment_model_lib['single-model_hurdle_gbt'].model.value_regressor.predict( np.c_[X,     np.ones((X.shape[0],1))] )     - treatment_model_lib['single-model_hurdle_gbt'].model.value_regressor.predict(np.c_[X, np.zeros((X.shape[0],1))])
-    treatment_basketvalue_test["single-model_hurdle_gbt"]  = treatment_model_lib['single-model_hurdle_gbt'].model.value_regressor.predict( np.c_[X_val, np.ones((X_val.shape[0],1))] ) - treatment_model_lib['single-model_hurdle_gbt'].model.value_regressor.predict(np.c_[X_val, np.zeros((X_val.shape[0],1))])
+    treatment_basketvalue_test["single-model_hurdle_gbt"]  = treatment_model_lib['single-model_hurdle_gbt'].model.value_regressor.predict( np.c_[X_test, np.ones((X_test.shape[0],1))] ) - treatment_model_lib['single-model_hurdle_gbt'].model.value_regressor.predict(np.c_[X_test, np.zeros((X_test.shape[0],1))])
 
     treatment_basketvalue_train["two-model_hurdle_linear"] = treatment_model_lib['two-model_hurdle_linear'].treatment_group_model.predict_value(X) - treatment_model_lib['two-model_hurdle_linear'].control_group_model.predict_value(X)
-    treatment_basketvalue_test["two-model_hurdle_linear"] = treatment_model_lib['two-model_hurdle_linear'].treatment_group_model.predict_value(X_val) - treatment_model_lib['two-model_hurdle_linear'].control_group_model.predict_value(X_val)
+    treatment_basketvalue_test["two-model_hurdle_linear"] = treatment_model_lib['two-model_hurdle_linear'].treatment_group_model.predict_value(X_test) - treatment_model_lib['two-model_hurdle_linear'].control_group_model.predict_value(X_test)
 
     treatment_basketvalue_train["two-model_hurdle_gbt"] = treatment_model_lib['two-model_hurdle_gbt'].treatment_group_model.predict_value(X) - treatment_model_lib['two-model_hurdle_gbt'].control_group_model.predict_value(X)
-    treatment_basketvalue_test["two-model_hurdle_gbt"] = treatment_model_lib['two-model_hurdle_gbt'].treatment_group_model.predict_value(X_val) - treatment_model_lib['two-model_hurdle_gbt'].control_group_model.predict_value(X_val)
+    treatment_basketvalue_test["two-model_hurdle_gbt"] = treatment_model_lib['two-model_hurdle_gbt'].treatment_group_model.predict_value(X_test) - treatment_model_lib['two-model_hurdle_gbt'].control_group_model.predict_value(X_test)
     
     treatment_basketvalue_train["ATE__"] = (y[(c==1) & (g==1)].mean())-(y[(c==1) & (g==0)].mean()) * np.ones([X.shape[0]])
-    treatment_basketvalue_test["ATE__"] =   (y[(c==1) & (g==1)].mean())-(y[(c==1) & (g==0)].mean()) * np.ones([X_val.shape[0]])
+    treatment_basketvalue_test["ATE__"] =   (y[(c==1) & (g==1)].mean())-(y[(c==1) & (g==0)].mean()) * np.ones([X_test.shape[0]])
 
     treatment_basketvalue_train["oracle__"] =  tau_basket
-    treatment_basketvalue_test["oracle__"] =   tau_basket_val
+    treatment_basketvalue_test["oracle__"] =   tau_basket_test
 
     # ##### Treatment response prediction
 
     treatment_pred_train = {key: model.predict(X) for key, model in treatment_model_lib.items()}
-    treatment_pred_test = {key: model.predict(X_val) for key, model in treatment_model_lib.items()}
+    treatment_pred_test = {key: model.predict(X_test) for key, model in treatment_model_lib.items()}
+    treatment_pred_val = {key: model.predict(X_val) for key, model in treatment_model_lib.items()}
 
     # Baselines
     treatment_pred_train["oracle__"] = tau_response
-    treatment_pred_test["oracle__"] =   tau_response_val
+    treatment_pred_test["oracle__"] =   tau_response_test
+    treatment_pred_val["oracle__"] =   tau_response_val
 
     treatment_pred_train["ATE__"] = (y[g==1].mean())-(y[g==0].mean()) * np.ones([X.shape[0]])
-    treatment_pred_test["ATE__"] =   (y[g==1].mean())-(y[g==0].mean()) * np.ones([X_val.shape[0]])
+    treatment_pred_test["ATE__"] =   (y[g==1].mean())-(y[g==0].mean()) * np.ones([X_test.shape[0]])
+    treatment_pred_val["ATE__"] =   (y[g==1].mean())-(y[g==0].mean()) * np.ones([X_val.shape[0]])
 
 
     ############ Conversion C(T=1) prediction
     conversion_pred_train = {key: model.predict_proba(X)[:,1]   for key, model in conversion_model_lib.items()}
-    conversion_pred_val = {key: model.predict_proba(X_val)[:,1] for key, model in conversion_model_lib.items()}
+    conversion_pred_test = {key: model.predict_proba(X_test)[:,1] for key, model in conversion_model_lib.items()}
 
     conversion_pred_train["single-model_hurdle_gbt"] =   treatment_model_lib['single-model_hurdle_gbt'].model.conversion_classifier.predict_proba( np.c_[X, np.ones((X.shape[0],1))] )[:,1]
-    conversion_pred_val["single-model_hurdle_gbt"] =     treatment_model_lib['single-model_hurdle_gbt'].model.conversion_classifier.predict_proba( np.c_[X_val, np.ones((X_val.shape[0],1))])[:,1]
-
-    #conversion_pred_train["hurdle_rf"] =   treatment_model_lib['hurdle_rf'].model.conversion_classifier.predict_proba( np.c_[X, np.ones((X.shape[0],1))] )[:,1]
-    #conversion_pred_val["hurdle_rf"] =     treatment_model_lib['hurdle_rf'].model.conversion_classifier.predict_proba( np.c_[X_val, np.ones((X_val.shape[0],1))])[:,1]
+    conversion_pred_test["single-model_hurdle_gbt"] =     treatment_model_lib['single-model_hurdle_gbt'].model.conversion_classifier.predict_proba( np.c_[X_test, np.ones((X_test.shape[0],1))])[:,1]
 
     conversion_pred_train["two-model_hurdle_linear"] = treatment_model_lib["two-model_hurdle_linear"].treatment_group_model.conversion_classifier.predict_proba(X)[:,1]
-    conversion_pred_val["two-model_hurdle_linear"] = treatment_model_lib["two-model_hurdle_linear"].treatment_group_model.conversion_classifier.predict_proba(X_val)[:,1]
-
-    #conversion_pred_train["two_model_hurdle_rf"] = treatment_model_lib["two_model_hurdle_rf"].treatment_group_model.conversion_classifier.predict_proba(X)[:,1]
-    #conversion_pred_val["two_model_hurdle_rf"] = treatment_model_lib["two_model_hurdle_rf"].treatment_group_model.conversion_classifier.predict_proba(X_val)[:,1]
+    conversion_pred_test["two-model_hurdle_linear"] = treatment_model_lib["two-model_hurdle_linear"].treatment_group_model.conversion_classifier.predict_proba(X_test)[:,1]
 
     conversion_pred_train["two-model_hurdle_gbt"] = treatment_model_lib["two-model_hurdle_gbt"].treatment_group_model.conversion_classifier.predict_proba(X)[:,1]
-    conversion_pred_val["two-model_hurdle_gbt"] = treatment_model_lib["two-model_hurdle_gbt"].treatment_group_model.conversion_classifier.predict_proba(X_val)[:,1]
+    conversion_pred_test["two-model_hurdle_gbt"] = treatment_model_lib["two-model_hurdle_gbt"].treatment_group_model.conversion_classifier.predict_proba(X_test)[:,1]
 
     conversion_pred_train["Conversion-Rate__"] = np.ones(X.shape[0]) * c[g==1].mean()
-    conversion_pred_val["Conversion-Rate__"] =   np.ones(X_val.shape[0]) * c[g==1].mean()
+    conversion_pred_test["Conversion-Rate__"] =   np.ones(X_test.shape[0]) * c[g==1].mean()
 
     ## Output formatting
-    return({"train":{"idx": split[0],
+    return({"train":{"idx": split['train'],
         "conversion": conversion_pred_train,
         "treatment_conversion": treatment_conversion_train,
         "treatment_basket_value": treatment_basketvalue_train,
         "treatment_spending": treatment_pred_train,
         "params":params
     }, 
-            "test":{"idx": split[1],
-        "conversion": conversion_pred_val,
+            "test":{"idx": split['test'],
+        "conversion": conversion_pred_test,
         "treatment_conversion": treatment_conversion_test,
         "treatment_basket_value": treatment_basketvalue_test,
         "treatment_spending": treatment_pred_test
+    },
+        "val":{"idx": split['val'],
+            "treatment_spending": treatment_pred_val
     }
+
             })
 
 
@@ -521,6 +546,8 @@ if __name__ == "__main__":
     splitter = StratifiedKFold(n_splits=N_SPLITS, shuffle=True, random_state=SEED)
     cg_groups = 2*g+c # Groups 0-4 depending on combinations [0,1]x[0,1]
     folds = list(splitter.split(X, cg_groups))
+
+    folds = get_train_validation_test_split(folds, val_set = True)
     
     library_predictions = []
     def log_result(x):

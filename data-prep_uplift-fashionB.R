@@ -164,8 +164,8 @@ xgb_conversion <- xgb.train(data=data_converted_tr, watchlist = list(tr = data_c
 
 
 # Simulation
-TAU_CONVERSION <- tau_model_linear(X_tau, ATE=0.05, tau_range = 0.1, tau_min=-0.1, tau_max=0.15)
-#TAU_CONVERSION <- tau_model(X_tau, hidden_layer=3*ncol(X_tau), ATE=0.05, tau_range = 0.1, tau_min=-0.1, tau_max=0.15)
+#TAU_CONVERSION <- tau_model_linear(X_tau, ATE=0.05, tau_range = 0.1, tau_min=-0.1, tau_max=0.15)
+TAU_CONVERSION <- tau_model(X_tau, hidden_layer=3*ncol(X_tau), ATE=0.05, tau_range = 0.1, tau_min=-0.1, tau_max=0.15)
 plot(density(TAU_CONVERSION))
 quantile(TAU_CONVERSION, probs=seq(0,1,0.1))
 
@@ -213,4 +213,4 @@ quantile(data$TREATMENT_EFFECT_RESPONSE, probs=seq(0,1,0.1))
 MARGIN <- 0.3
 mean( (data$TREATMENT_EFFECT_RESPONSE*MARGIN) > ((conv_pred+TAU_CONVERSION)*10) )
 
-fwrite(data, "~/Downloads/fashionB_clean_linear.csv")
+fwrite(data, "~/Downloads/fashionB_clean_nonlinear.csv")
